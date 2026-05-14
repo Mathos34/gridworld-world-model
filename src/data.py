@@ -1,8 +1,8 @@
-"""Gridworld environment and random-trajectory dataset.
+"""Gridworld environment + multi-step trajectory dataset.
 
-Observations are 3-channel one-hot grids: (agent, wall, goal).
-Actions: 0=up, 1=down, 2=left, 3=right.
-We also record agent cell indices for the auxiliary position head.
+Observations: 3-channel one-hot grids (agent, wall, goal). Actions: 0=up,
+1=down, 2=left, 3=right. We expose K-step rollouts so the predictor can be
+trained to be self-consistent over short horizons (multi-step prediction loss).
 """
 from __future__ import annotations
 
@@ -13,11 +13,16 @@ from torch.utils.data import Dataset
 GRID_SIZE = 8
 N_ACTIONS = 4
 N_CHANNELS = 3
+N_CELLS = GRID_SIZE * GRID_SIZE
 ACTIONS = np.array([(-1, 0), (1, 0), (0, -1), (0, 1)], dtype=np.int64)
 
 
 def cell_to_idx(r: int, c: int) -> int:
     return r * GRID_SIZE + c
+
+
+def idx_to_cell(idx: int) -> tuple[int, int]:
+    return idx // GRID_SIZE, idx % GRID_SIZE
 
 
 def _free_cell(rng: np.random.Generator, walls: np.ndarray, forbidden: set[tuple[int, int]]) -> tuple[int, int]:
@@ -28,7 +33,7 @@ def _free_cell(rng: np.random.Generator, walls: np.ndarray, forbidden: set[tuple
 
 
 def make_walls(rng: np.random.Generator) -> np.ndarray:
-    """Build a vertical or horizontal wall with a single random gap."""
+    """Vertical or horizontal wall with a random gap."""
     walls = np.zeros((GRID_SIZE, GRID_SIZE), dtype=np.int64)
     vertical = bool(rng.integers(0, 2))
     line = int(rng.integers(2, GRID_SIZE - 2))
@@ -51,8 +56,6 @@ def encode_obs(agent: tuple[int, int], walls: np.ndarray, goal: tuple[int, int])
 
 
 class GridWorld:
-    """Minimal deterministic gridworld. Walls block movement; out-of-bounds blocks."""
-
     def __init__(self, seed: int = 0):
         self.rng = np.random.default_rng(seed)
         self.reset()
@@ -80,41 +83,88 @@ class GridWorld:
         return self.obs(), done
 
 
-class TrajectoryDataset(Dataset):
-    """Collect (obs_t, action, obs_{t+1}, pos_t, pos_{t+1}) tuples."""
+def step_pos(walls: np.ndarray, agent: tuple[int, int], action: int) -> tuple[int, int]:
+    dr, dc = ACTIONS[action]
+    nr, nc = agent[0] + dr, agent[1] + dc
+    if 0 <= nr < GRID_SIZE and 0 <= nc < GRID_SIZE and walls[nr, nc] == 0:
+        return nr, nc
+    return agent
 
-    def __init__(self, n_traj: int = 10_000, traj_len: int = 20, seed: int = 42):
+
+class TrajectoryDataset(Dataset):
+    """Per item, a length-K *synthetic* trajectory starting from a uniformly
+    sampled free cell on a freshly sampled (walls, goal). Every step picks a
+    uniform random action and updates the agent position by the true dynamics.
+    This gives uniform coverage of (walls, agent_position, action) instead of
+    the biased coverage you get from rolling out a random policy in a single
+    fixed environment.
+    """
+
+    def __init__(self, n_traj: int = 10_000, traj_len: int = 8, seed: int = 42):
+        self.K = traj_len
         rng = np.random.default_rng(seed)
-        env = GridWorld(seed=seed)
-        obs_t, acts, obs_tp1, pos_t, pos_tp1 = [], [], [], [], []
-        for _ in range(n_traj):
-            o = env.reset()
-            for _ in range(traj_len):
+        obs_buf = np.zeros((n_traj, traj_len + 1, N_CHANNELS, GRID_SIZE, GRID_SIZE), dtype=np.float32)
+        act_buf = np.zeros((n_traj, traj_len), dtype=np.int64)
+        pos_buf = np.zeros((n_traj, traj_len + 1), dtype=np.int64)
+        for i in range(n_traj):
+            walls = make_walls(rng)
+            agent = _free_cell(rng, walls, set())
+            goal = _free_cell(rng, walls, {agent})
+            obs_buf[i, 0] = encode_obs(agent, walls, goal)
+            pos_buf[i, 0] = cell_to_idx(*agent)
+            for t in range(traj_len):
                 a = int(rng.integers(0, N_ACTIONS))
-                prev_agent = env.agent
-                o_next, done = env.step(a)
-                obs_t.append(o)
-                acts.append(a)
-                obs_tp1.append(o_next)
-                pos_t.append(cell_to_idx(*prev_agent))
-                pos_tp1.append(cell_to_idx(*env.agent))
-                o = o_next
-                if done:
-                    break
-        self.obs_t = np.stack(obs_t).astype(np.float32)
-        self.acts = np.asarray(acts, dtype=np.int64)
-        self.obs_tp1 = np.stack(obs_tp1).astype(np.float32)
-        self.pos_t = np.asarray(pos_t, dtype=np.int64)
-        self.pos_tp1 = np.asarray(pos_tp1, dtype=np.int64)
+                agent = step_pos(walls, agent, a)
+                obs_buf[i, t + 1] = encode_obs(agent, walls, goal)
+                act_buf[i, t] = a
+                pos_buf[i, t + 1] = cell_to_idx(*agent)
+        self.obs = obs_buf
+        self.act = act_buf
+        self.pos = pos_buf
 
     def __len__(self) -> int:
-        return self.obs_t.shape[0]
+        return self.obs.shape[0]
 
     def __getitem__(self, idx: int):
         return (
-            torch.from_numpy(self.obs_t[idx]),
-            torch.tensor(self.acts[idx], dtype=torch.long),
-            torch.from_numpy(self.obs_tp1[idx]),
-            torch.tensor(self.pos_t[idx], dtype=torch.long),
-            torch.tensor(self.pos_tp1[idx], dtype=torch.long),
+            torch.from_numpy(self.obs[idx]),
+            torch.from_numpy(self.act[idx]),
+            torch.from_numpy(self.pos[idx]),
+        )
+
+
+class UniformTransitionDataset(Dataset):
+    """Per item, an (obs_t, action, obs_{t+1}, pos_t, pos_{t+1}) tuple sampled
+    by drawing fresh (walls, agent, goal, action) uniformly at random. Best
+    coverage of the state-action space; also fastest to generate."""
+
+    def __init__(self, n_samples: int = 80_000, seed: int = 42):
+        rng = np.random.default_rng(seed)
+        self.K = 1
+        obs_buf = np.zeros((n_samples, 2, N_CHANNELS, GRID_SIZE, GRID_SIZE), dtype=np.float32)
+        act_buf = np.zeros((n_samples, 1), dtype=np.int64)
+        pos_buf = np.zeros((n_samples, 2), dtype=np.int64)
+        for i in range(n_samples):
+            walls = make_walls(rng)
+            agent = _free_cell(rng, walls, set())
+            goal = _free_cell(rng, walls, {agent})
+            a = int(rng.integers(0, N_ACTIONS))
+            next_agent = step_pos(walls, agent, a)
+            obs_buf[i, 0] = encode_obs(agent, walls, goal)
+            obs_buf[i, 1] = encode_obs(next_agent, walls, goal)
+            act_buf[i, 0] = a
+            pos_buf[i, 0] = cell_to_idx(*agent)
+            pos_buf[i, 1] = cell_to_idx(*next_agent)
+        self.obs = obs_buf
+        self.act = act_buf
+        self.pos = pos_buf
+
+    def __len__(self) -> int:
+        return self.obs.shape[0]
+
+    def __getitem__(self, idx: int):
+        return (
+            torch.from_numpy(self.obs[idx]),
+            torch.from_numpy(self.act[idx]),
+            torch.from_numpy(self.pos[idx]),
         )

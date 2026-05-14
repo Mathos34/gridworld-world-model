@@ -1,100 +1,120 @@
-"""Cross-Entropy Method planner operating in latent space.
+"""BFS planner that runs entirely on the learned simulator.
 
-Reward shaping: we score plans by Manhattan distance between the position
-predicted by the auxiliary position head and the goal cell. The latent
-transition predictor handles the dynamics, the position head handles the
-grounding. This keeps the planner principled while staying in latent space.
+Per planning step we precompute a 64x4 transition table T[cell, action] -> next_cell
+by encoding 64 synthetic observations (one per possible agent position, with the
+*current* walls and goal) and advancing each by each of the 4 actions. The next
+agent cell is the argmax of the position head on the resulting latent. BFS over
+this table finds the shortest predicted action sequence to the goal; we play its
+first action and replan the next step (MPC).
+
+If the BFS cannot reach the goal in the predicted graph (rare with a well-trained
+model), we fall back to a Manhattan-greedy action.
 """
 from __future__ import annotations
+
+from collections import deque
 
 import numpy as np
 import torch
 
-from .data import GRID_SIZE, GridWorld, N_ACTIONS, cell_to_idx, encode_obs
+from .data import ACTIONS, GRID_SIZE, GridWorld, N_ACTIONS, N_CELLS, encode_obs
 from .model import WorldModel
 
 
 @torch.no_grad()
-def predicted_cell(model: WorldModel, z: torch.Tensor) -> torch.Tensor:
-    logits = model.position_head(z)
-    return logits.argmax(dim=-1)
+def build_transition_table(model: WorldModel, walls: np.ndarray, goal: tuple[int, int]) -> np.ndarray:
+    """Returns T of shape (N_CELLS, N_ACTIONS) with T[c, a] = predicted next cell."""
+    obs_batch = np.zeros((N_CELLS, 3, GRID_SIZE, GRID_SIZE), dtype=np.float32)
+    for r in range(GRID_SIZE):
+        for c in range(GRID_SIZE):
+            obs_batch[r * GRID_SIZE + c] = encode_obs((r, c), walls, goal)
+    obs_t = torch.from_numpy(obs_batch)
+    z = model.encoder(obs_t)
+    T = np.zeros((N_CELLS, N_ACTIONS), dtype=np.int64)
+    for a in range(N_ACTIONS):
+        a_t = torch.full((N_CELLS,), a, dtype=torch.long)
+        z_next = model.predictor(z, a_t)
+        T[:, a] = model.position_head(z_next).argmax(dim=-1).cpu().numpy()
+    return T
 
 
-def _cell_to_rc(cells: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    return cells // GRID_SIZE, cells % GRID_SIZE
+def bfs_first_action(T: np.ndarray, start: int, goal: int) -> int | None:
+    """BFS over the predicted dynamics graph. Returns the first action of a
+    shortest path from start to goal, or None if unreachable."""
+    if start == goal:
+        return None
+    parent_action = -np.ones(N_CELLS, dtype=np.int64)
+    parent_state = -np.ones(N_CELLS, dtype=np.int64)
+    visited = np.zeros(N_CELLS, dtype=bool)
+    visited[start] = True
+    q = deque([start])
+    while q:
+        s = q.popleft()
+        for a in range(N_ACTIONS):
+            ns = int(T[s, a])
+            if visited[ns]:
+                continue
+            visited[ns] = True
+            parent_state[ns] = s
+            parent_action[ns] = a
+            if ns == goal:
+                # Reconstruct: walk back to start, return first action.
+                cur = ns
+                while parent_state[cur] != start:
+                    cur = int(parent_state[cur])
+                return int(parent_action[cur])
+            q.append(ns)
+    return None
+
+
+def manhattan_greedy(walls: np.ndarray, agent: tuple[int, int], goal: tuple[int, int]) -> int:
+    best_a, best_d = 0, 1e9
+    for a, (dr, dc) in enumerate(ACTIONS):
+        nr, nc = agent[0] + dr, agent[1] + dc
+        if not (0 <= nr < GRID_SIZE and 0 <= nc < GRID_SIZE):
+            continue
+        if walls[nr, nc] == 1:
+            continue
+        d = abs(nr - goal[0]) + abs(nc - goal[1])
+        if d < best_d:
+            best_d, best_a = d, a
+    return best_a
 
 
 @torch.no_grad()
-def cem_plan(model: WorldModel, obs: np.ndarray, goal: tuple[int, int],
-             horizon: int = 15, n_candidates: int = 100, n_elite: int = 10,
-             n_iter: int = 5, rng: np.random.Generator | None = None) -> int:
-    """Plan a horizon of actions; return the first action of the converged distribution.
-
-    Cost(plan) = sum_t Manhattan(decoded_pos(z_t), goal). We also bonus reaching the goal.
-    """
-    if rng is None:
-        rng = np.random.default_rng(0)
-    device = next(model.parameters()).device
-    obs_t = torch.from_numpy(obs).unsqueeze(0).to(device)
-    z0 = model.encoder(obs_t)
-    goal_r, goal_c = goal
-
-    logits = np.zeros((horizon, N_ACTIONS), dtype=np.float32)
-
-    for _ in range(n_iter):
-        probs = np.exp(logits - logits.max(axis=1, keepdims=True))
-        probs = probs / probs.sum(axis=1, keepdims=True)
-        actions = np.zeros((n_candidates, horizon), dtype=np.int64)
-        for t in range(horizon):
-            actions[:, t] = rng.choice(N_ACTIONS, size=n_candidates, p=probs[t])
-
-        z = z0.expand(n_candidates, -1).clone()
-        cost = torch.zeros(n_candidates, device=device)
-        reached_bonus = torch.zeros(n_candidates, device=device)
-        for t in range(horizon):
-            a = torch.from_numpy(actions[:, t]).to(device)
-            z = model.predictor(z, a)
-            cells = predicted_cell(model, z).cpu().numpy()
-            rs, cs = _cell_to_rc(cells)
-            manh = np.abs(rs - goal_r) + np.abs(cs - goal_c)
-            cost = cost + torch.from_numpy(manh.astype(np.float32)).to(device)
-            reached = torch.from_numpy((manh == 0).astype(np.float32)).to(device)
-            reached_bonus = torch.maximum(reached_bonus, reached * (horizon - t))
-        score = -cost + 5.0 * reached_bonus
-
-        elite_idx = torch.topk(score, k=n_elite).indices.cpu().numpy()
-        elite_actions = actions[elite_idx]
-        new_logits = np.zeros_like(logits)
-        for t in range(horizon):
-            counts = np.bincount(elite_actions[:, t], minlength=N_ACTIONS).astype(np.float32)
-            counts = counts + 0.1
-            new_logits[t] = np.log(counts / counts.sum())
-        logits = 0.3 * logits + 0.7 * new_logits
-
-    probs = np.exp(logits - logits.max(axis=1, keepdims=True))
-    probs = probs / probs.sum(axis=1, keepdims=True)
-    return int(np.argmax(probs[0]))
+def plan_action(model: WorldModel, agent: tuple[int, int], walls: np.ndarray,
+                goal: tuple[int, int]) -> int:
+    T = build_transition_table(model, walls, goal)
+    s = agent[0] * GRID_SIZE + agent[1]
+    g = goal[0] * GRID_SIZE + goal[1]
+    a = bfs_first_action(T, s, g)
+    if a is None:
+        return manhattan_greedy(walls, agent, goal)
+    return a
 
 
-def evaluate_planner(model: WorldModel, n_episodes: int = 100, max_steps: int = 30,
-                     seed: int = 1234, **plan_kwargs) -> tuple[float, list[bool]]:
-    rng = np.random.default_rng(seed)
+def evaluate_planner(model: WorldModel, n_episodes: int = 100, max_steps: int = 50,
+                     seed: int = 1234) -> tuple[float, list[int]]:
     env = GridWorld(seed=seed)
     successes = []
-    for ep in range(n_episodes):
-        obs = env.reset()
+    steps_taken = []
+    for _ in range(n_episodes):
+        env.reset()
         success = False
-        for _ in range(max_steps):
-            action = cem_plan(model, obs, env.goal, rng=rng, **plan_kwargs)
-            obs, done = env.step(action)
+        for step in range(max_steps):
+            a = plan_action(model, env.agent, env.walls, env.goal)
+            _, done = env.step(a)
             if done:
                 success = True
+                steps_taken.append(step + 1)
                 break
         successes.append(success)
-    return float(np.mean(successes)), successes
+        if not success:
+            steps_taken.append(max_steps)
+    return float(np.mean(successes)), steps_taken
 
 
-def evaluate_random(n_episodes: int = 100, max_steps: int = 30, seed: int = 1234) -> float:
+def evaluate_random(n_episodes: int = 100, max_steps: int = 50, seed: int = 1234) -> float:
     rng = np.random.default_rng(seed)
     env = GridWorld(seed=seed)
     n_success = 0
@@ -102,6 +122,37 @@ def evaluate_random(n_episodes: int = 100, max_steps: int = 30, seed: int = 1234
         env.reset()
         for _ in range(max_steps):
             a = int(rng.integers(0, N_ACTIONS))
+            _, done = env.step(a)
+            if done:
+                n_success += 1
+                break
+    return n_success / n_episodes
+
+
+def evaluate_oracle_bfs(n_episodes: int = 100, max_steps: int = 50, seed: int = 1234) -> float:
+    """Upper bound: BFS over the *true* dynamics. Useful to know how much
+    reachable success rate is possible for these random initial states."""
+    env = GridWorld(seed=seed)
+    n_success = 0
+    for _ in range(n_episodes):
+        env.reset()
+        # True transition: try the action; if blocked (wall or oob) state stays.
+        for _ in range(max_steps):
+            T = np.zeros((N_CELLS, N_ACTIONS), dtype=np.int64)
+            for r in range(GRID_SIZE):
+                for c in range(GRID_SIZE):
+                    s = r * GRID_SIZE + c
+                    for a, (dr, dc) in enumerate(ACTIONS):
+                        nr, nc = r + dr, c + dc
+                        if not (0 <= nr < GRID_SIZE and 0 <= nc < GRID_SIZE) or env.walls[nr, nc] == 1:
+                            T[s, a] = s
+                        else:
+                            T[s, a] = nr * GRID_SIZE + nc
+            s0 = env.agent[0] * GRID_SIZE + env.agent[1]
+            g = env.goal[0] * GRID_SIZE + env.goal[1]
+            a = bfs_first_action(T, s0, g)
+            if a is None:
+                break
             _, done = env.step(a)
             if done:
                 n_success += 1
