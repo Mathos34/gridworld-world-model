@@ -17,7 +17,7 @@ from collections import deque
 import numpy as np
 import torch
 
-from .data import ACTIONS, GRID_SIZE, GridWorld, N_ACTIONS, N_CELLS, encode_obs
+from .data import ACTIONS, GRID_SIZE, N_ACTIONS, N_CELLS, GridWorld, encode_obs
 from .model import WorldModel
 
 
