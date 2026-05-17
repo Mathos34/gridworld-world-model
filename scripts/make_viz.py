@@ -101,7 +101,7 @@ def main():
     ax_bar.set_ylabel("Success rate (%)")
     ax_bar.set_ylim(0, 105)
     ax_bar.set_title(f"Success on {metrics['eval_episodes']} fresh episodes")
-    for b, v in zip(bars, vals):
+    for b, v in zip(bars, vals, strict=False):
         ax_bar.text(b.get_x() + b.get_width() / 2, v + 2, f"{v:.1f}%", ha="center", fontsize=11)
     ax_bar.grid(axis="y", alpha=0.3)
 

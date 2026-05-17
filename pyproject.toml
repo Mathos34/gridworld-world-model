@@ -1,0 +1,67 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gridworld-world-model"
+version = "0.1.0"
+description = "A latent world model and BFS planner on a 2D gridworld, in the spirit of JEPA."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Mathis Lacombe" }]
+requires-python = ">=3.10"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.2.0,<2.6.0",
+    "numpy>=1.26",
+    "matplotlib>=3.8",
+    "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.4.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/Mathos34/gridworld-world-model"
+Repository = "https://github.com/Mathos34/gridworld-world-model"
+
+[tool.setuptools.packages.find]
+include = ["src*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+extend-exclude = ["assets", "runs", ".venv"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "W",   # pycodestyle warnings
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "UP",  # pyupgrade
+]
+ignore = [
+    "E501",  # line too long (matplotlib viz code legitimately exceeds)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"scripts/*" = ["E402"]  # allow imports after sys.path manipulation
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-q --strict-markers"
